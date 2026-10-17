@@ -11,9 +11,7 @@ on:
       'ggml/src/spacemit/*',
       'ggml/src/arch/loongarch/*'
     ]
-  # run once every week
-  schedule:
-    - cron: '0 0 * * 0'
+  # (fork: weekly cron removed)
 
 cache-mode: none
 permissions:

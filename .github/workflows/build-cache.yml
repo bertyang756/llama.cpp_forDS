@@ -1,9 +1,7 @@
 name: Build Actions Cache
 
 on:
-  workflow_dispatch: # allows manual triggering
-  schedule:
-    - cron: '0 * * * *'
+  workflow_dispatch: # allows manual triggering (fork: cron removed)
 
 cache-mode: write
 permissions:

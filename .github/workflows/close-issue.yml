@@ -1,7 +1,6 @@
 name: Close inactive issues
 on:
-  schedule:
-    - cron: "42 0 * * *"
+  workflow_dispatch: # allows manual triggering (fork: daily cron removed)
 
 cache-mode: none
 permissions:
