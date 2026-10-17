@@ -1899,3 +1899,227 @@ void server_prompt_cache::update() {
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
 }
+
+//
+// --cache-file: persist/restore the whole prompt cache to/from a disk file
+//
+
+static void write_bytes(std::ofstream & f, const void * data, size_t size) {
+    f.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(size));
+}
+
+static void write_vec_u8(std::ofstream & f, const std::vector<uint8_t> & vec) {
+    const uint32_t n = (uint32_t) vec.size();
+    write_bytes(f, &n, sizeof(n));
+    write_bytes(f, vec.data(), vec.size());
+}
+
+static bool read_bytes(std::ifstream & f, void * data, size_t size) {
+    f.read(reinterpret_cast<char *>(data), static_cast<std::streamsize>(size));
+    return !f.fail();
+}
+
+static bool read_vec_u8(std::ifstream & f, std::vector<uint8_t> & vec) {
+    uint32_t n = 0;
+    if (!read_bytes(f, &n, sizeof(n))) {
+        return false;
+    }
+    vec.resize(n);
+    if (n > 0 && !read_bytes(f, vec.data(), n)) {
+        return false;
+    }
+    return true;
+}
+
+bool server_prompt_cache::save_to_file(const std::string & path, const std::string & model_filename) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        SRV_ERR("failed to open cache file '%s' for writing\n", path.c_str());
+        return false;
+    }
+
+    const char magic[3] = {'P', 'C', 'F'};
+    const uint32_t version = 3; // v3: header records the model base filename
+    const uint32_t count   = (uint32_t) states.size();
+
+    write_bytes(f, magic, 3);
+    write_bytes(f, &version, sizeof(version));
+
+    // model base filename (just the file name, no path)
+    const uint32_t mf_len = (uint32_t) model_filename.size();
+    write_bytes(f, &mf_len, sizeof(mf_len));
+    write_bytes(f, model_filename.data(), model_filename.size());
+
+    write_bytes(f, &count, sizeof(count));
+
+    for (const auto & state : states) {
+        // tokens (server_tokens::serialize, includes media chunks)
+        std::vector<char> ser;
+        try {
+            ser = state.prompt.tokens.serialize();
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to serialize tokens for cache entry: %s\n", e.what());
+            return false;
+        }
+
+        const uint32_t ser_len = (uint32_t) ser.size();
+        write_bytes(f, &ser_len, sizeof(ser_len));
+        write_bytes(f, ser.data(), ser.size());
+
+        // checkpoints
+        const uint32_t n_ckpt = (uint32_t) state.prompt.checkpoints.size();
+        write_bytes(f, &n_ckpt, sizeof(n_ckpt));
+        for (const auto & ckpt : state.prompt.checkpoints) {
+            write_bytes(f, &ckpt.n_tokens, sizeof(ckpt.n_tokens));
+            write_bytes(f, &ckpt.id_task,  sizeof(ckpt.id_task));
+            write_bytes(f, &ckpt.pos_min,  sizeof(ckpt.pos_min));
+            write_bytes(f, &ckpt.pos_max,  sizeof(ckpt.pos_max));
+            write_vec_u8(f, ckpt.data_tgt);
+            write_vec_u8(f, ckpt.data_dft);
+            write_vec_u8(f, ckpt.data_spec);
+        }
+
+        // data
+        write_vec_u8(f, state.data.main);
+        write_vec_u8(f, state.data.drft);
+    }
+
+    f.flush();
+    if (!f) {
+        SRV_ERR("failed to write cache file '%s'\n", path.c_str());
+        return false;
+    }
+
+    SRV_INF("saved prompt cache to '%s': %zu prompts, %.3f MiB\n",
+            path.c_str(), states.size(), size() / (1024.0 * 1024.0));
+
+    return true;
+}
+
+bool server_prompt_cache::load_from_file(const std::string & path, bool has_mtmd, const std::string & model_filename) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        SRV_ERR("failed to open cache file '%s' for reading\n", path.c_str());
+        return false;
+    }
+
+    char magic[3];
+    if (!read_bytes(f, magic, 3) || magic[0] != 'P' || magic[1] != 'C' || magic[2] != 'F') {
+        SRV_WRN("cache file '%s': invalid magic, skipping load\n", path.c_str());
+        return false;
+    }
+
+    uint32_t version = 0;
+    read_bytes(f, &version, sizeof(version));
+    if (version != 3 || f.fail()) {
+        SRV_WRN("cache file '%s': unsupported version, skipping load\n", path.c_str());
+        return false;
+    }
+
+    // model base filename recorded in the header
+    uint32_t mf_len = 0;
+    if (!read_bytes(f, &mf_len, sizeof(mf_len)) || mf_len > (1u << 20)) {
+        SRV_WRN("cache file '%s': corrupt model filename, skipping load\n", path.c_str());
+        return false;
+    }
+    std::string file_model(mf_len, '\0');
+    if (mf_len > 0 && !read_bytes(f, file_model.data(), mf_len)) {
+        SRV_WRN("cache file '%s': truncated model filename, skipping load\n", path.c_str());
+        return false;
+    }
+
+    uint32_t count = 0;
+    read_bytes(f, &count, sizeof(count));
+    if (f.fail()) {
+        SRV_WRN("cache file '%s': corrupt entry count, skipping load\n", path.c_str());
+        return false;
+    }
+
+    SRV_INF("cache file '%s': recorded model '%s'%s\n",
+            path.c_str(), file_model.c_str(),
+            file_model != model_filename ? " (differs from current model)" : "");
+
+    size_t loaded = 0;
+    try {
+        for (uint32_t i = 0; i < count; ++i) {
+            server_prompt_cache_state st;
+
+            // tokens
+            uint32_t ser_len = 0;
+            if (!read_bytes(f, &ser_len, sizeof(ser_len)) || ser_len % sizeof(llama_token) != 0) {
+                SRV_WRN("cache file '%s': corrupt token data at entry %u, skipping rest\n", path.c_str(), i);
+                break;
+            }
+            std::vector<char> ser(ser_len);
+            if (ser_len > 0 && !read_bytes(f, ser.data(), ser_len)) {
+                SRV_WRN("cache file '%s': truncated token data at entry %u, skipping rest\n", path.c_str(), i);
+                break;
+            }
+
+            llama_tokens packed(ser_len / sizeof(llama_token));
+            if (ser_len > 0) {
+                memcpy(packed.data(), ser.data(), ser_len);
+            }
+            try {
+                st.prompt.tokens = server_tokens::deserialize(packed, has_mtmd);
+            } catch (const std::exception & e) {
+                SRV_WRN("cache file '%s': failed to restore tokens at entry %u: %s\n", path.c_str(), i, e.what());
+                continue;
+            }
+
+            // checkpoints
+            uint32_t n_ckpt = 0;
+            if (!read_bytes(f, &n_ckpt, sizeof(n_ckpt))) {
+                SRV_WRN("cache file '%s': corrupt checkpoint count at entry %u, skipping rest\n", path.c_str(), i);
+                break;
+            }
+            for (uint32_t c = 0; c < n_ckpt; ++c) {
+                common_prompt_checkpoint ckpt;
+                if (!read_bytes(f, &ckpt.n_tokens, sizeof(ckpt.n_tokens)) ||
+                    !read_bytes(f, &ckpt.id_task,  sizeof(ckpt.id_task)) ||
+                    !read_bytes(f, &ckpt.pos_min,  sizeof(ckpt.pos_min)) ||
+                    !read_bytes(f, &ckpt.pos_max,  sizeof(ckpt.pos_max)) ||
+                    !read_vec_u8(f, ckpt.data_tgt) ||
+                    !read_vec_u8(f, ckpt.data_dft) ||
+                    !read_vec_u8(f, ckpt.data_spec)) {
+                    SRV_WRN("cache file '%s': corrupt checkpoint data at entry %u, skipping rest\n", path.c_str(), i);
+                    break;
+                }
+                st.prompt.checkpoints.push_back(std::move(ckpt));
+            }
+
+            // data
+            if (!read_vec_u8(f, st.data.main) || !read_vec_u8(f, st.data.drft)) {
+                SRV_WRN("cache file '%s': corrupt state data at entry %u, skipping rest\n", path.c_str(), i);
+                break;
+            }
+
+            states.push_back(std::move(st));
+            ++loaded;
+        }
+    } catch (const std::exception & e) {
+        SRV_WRN("cache file '%s': failed to load entries: %s\n", path.c_str(), e.what());
+    }
+
+    // drop shortest entries first if we exceed the size limit
+    if (limit_size > 0) {
+        while (!states.empty() && size() > limit_size) {
+            auto it_min = states.begin();
+            for (auto it = states.begin(); it != states.end(); ++it) {
+                if (it->prompt.n_tokens() < it_min->prompt.n_tokens()) {
+                    it_min = it;
+                }
+            }
+            SRV_WRN(" - cache size limit reached, dropping shortest entry (%d tokens, %.3f MiB)\n",
+                    it_min->prompt.n_tokens(), it_min->size() / (1024.0 * 1024.0));
+            states.erase(it_min);
+        }
+    }
+
+    update();
+
+    SRV_INF("loaded prompt cache from '%s': %zu prompts, %.3f MiB\n",
+            path.c_str(), states.size(), size() / (1024.0 * 1024.0));
+
+    return true;
+}

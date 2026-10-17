@@ -153,3 +153,9 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Local dev leftovers (not part of the feature)
+
+CF
+*.bak
+*.orig

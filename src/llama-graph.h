@@ -813,6 +813,11 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // [方案A 阶段1] reserve/init 建图(仅做尺寸)标记: 让 src[5]/src[6(O3 叶子) 恒挂在 reserve 图上,
+    // 使 node_allocs[i].src[5]/[6] 恒覆盖 O3 decode 的叶子 → decode/prefill 零 realloc。
+    // 运行时(process_ubatch)恒为 false, 只在 attach_lid(真正的 O3 decode)时挂 src。
+    bool is_reserve = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -931,6 +936,8 @@ public:
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
     void set_params(const llm_graph_params & params);
+
+    const llm_graph_params & get_params() const { return params; }
 
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
@@ -1192,7 +1199,9 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * lid_csa_mask = nullptr, // O3: CSA causal mask for the fused sparse path
+            ggml_tensor * lid_top_k    = nullptr) const; // O3: CSA-space top-k indices
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

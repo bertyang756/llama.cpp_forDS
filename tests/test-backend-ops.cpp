@@ -11022,6 +11022,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
 
+    // [WIDE-SPARSE CALIBRATION, temp] model geometry hsk=hsv=512, nh=1, gqa=64 (nr23={64,1}),
+    // prefill nb=512 + decode nb=1 reference, F16 KV, n_kv_max=640; sweep kv (multiples of FATTN_KQ_STRIDE=256).
+    // Compare dense / per-query / wide sparse via GGML_CUDA_FAST_SPARSE_FORCE=dense|perq|wide.
+    for (int kv : {768, 1024, 1536, 2048, 2560, 4352, 8448, 30720}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 640));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4352, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 640));
+
     // sparse attn (qwen4 shape - gqa 12)
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
@@ -11499,6 +11507,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
     }
+
+    // [WIDE-SPARSE CALIBRATION, temp] model geometry hsk=hsv=512, nh=1, gqa=64 (nr23={64,1}),
+    // prefill nb=512 + decode nb=1 reference, F16 KV, n_kv_max=640; sweep kv (multiples of FATTN_KQ_STRIDE=256).
+    // Compare dense / per-query / wide sparse via GGML_CUDA_FAST_SPARSE_FORCE=dense|perq|wide.
+    for (int64_t kv : {768, 1024, 1536, 2048, 2560, 4352, 8448, 30720}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 640));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4352, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 640));
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

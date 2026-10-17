@@ -2512,6 +2512,18 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // LID (DeepSeek-V4) fused sparse path: hand the CSA causal mask and the top-k
+    // indices to the flash-attn op via the spare src[5]/src[6] slots, so the CUDA
+    // fused-index kernel can build the sparse positions from (raw SWA mask, CSA
+    // causal mask, top-k) instead of the materialized union mask chain.
+    // Only the CUDA sparse gather consumes these inputs; other backends reject
+    // the op in supports_op (fail-fast). The effective concat mask length is
+    // src[3]->ne[0] + lid_csa_mask->ne[0].
+    GGML_API void ggml_flash_attn_ext_set_lid(
+            struct ggml_tensor * a,
+            struct ggml_tensor * lid_csa_mask,
+            struct ggml_tensor * lid_top_k);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

@@ -1732,6 +1732,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_FLASH_ATTN_EXT:
+            // LID (DeepSeek-V4) fused sparse path via src[5]/src[6] is CUDA-only:
+            // reject explicitly (fail-fast) instead of silently ignoring the extra inputs.
+            if (op->src[5] != NULL || op->src[6] != NULL) {
+                return false;
+            }
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&
                 op->src[0]->ne[0] != 40 &&

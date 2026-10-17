@@ -273,6 +273,38 @@ static inline bool ggml_cuda_fast_ops_enabled(const char * op_flag) {
     return enabled;
 }
 
+// Runtime probe for the MoE expert-matmul (MUL_MAT_ID) flow.  Prints the real
+// shapes, the actually-taken code path, and the real kernel config (occupancy,
+// tile, grid) that IQ2XXS expert matmuls hit.  Read-only: never changes flow.
+//
+//   GGML_CUDA_MOE_PROBE=1        : IQ2XXS expert matmuls (default when set)
+//   GGML_CUDA_MOE_PROBE=all      : every quantized expert matmul
+//   GGML_CUDA_MOE_PROBE=verbose  : add per-expert / bucket / switch_J detail
+static inline bool ggml_cuda_moe_probe_enabled() {
+    const char * s = getenv("GGML_CUDA_MOE_PROBE");
+    return s != nullptr && std::atoi(s) != 0;
+}
+
+static inline bool ggml_cuda_moe_probe_all_types() {
+    const char * s = getenv("GGML_CUDA_MOE_PROBE");
+    return s != nullptr && std::string(s) == "all";
+}
+
+static inline bool ggml_cuda_moe_probe_verbose() {
+    const char * s = getenv("GGML_CUDA_MOE_PROBE");
+    return s != nullptr && std::string(s) == "verbose";
+}
+
+static inline bool ggml_cuda_moe_probe_type(const ggml_type type) {
+    if (!ggml_cuda_moe_probe_enabled()) {
+        return false;
+    }
+    if (ggml_cuda_moe_probe_all_types()) {
+        return ggml_is_quantized(type);
+    }
+    return type == GGML_TYPE_IQ2_XXS;
+}
+
 // Print the fast-path switch state once, at CUDA backend init, so that it shows
 // up in the startup output.  Like the CUDA device info this is ggml-level INFO,
 // which common/log.cpp maps to LOG_LEVEL_INFO, so it is visible at the default
@@ -284,6 +316,9 @@ static inline void ggml_cuda_fast_ops_print_startup() {
     // per-operator fast paths currently wired into the CUDA backend
     static const char * ops[] = {
         "GGML_CUDA_FAST_SOFTMAX",
+        "GGML_CUDA_FAST_LID_TOP_K",
+        "GGML_CUDA_FAST_SPARSE_LEN",
+        "GGML_CUDA_FAST_WIDE_SPARSE",
     };
 
     GGML_LOG_INFO("ggml_cuda: fast ops: GGML_CUDA_FAST_OPS=%s%s\n",
@@ -297,6 +332,13 @@ static inline void ggml_cuda_fast_ops_print_startup() {
                       master ? master : "unset");
     }
 
+    // wide sparse is a kernel-selection sub-switch that only matters when the sparse
+    // length heuristic is enabled; print the effective state (needs SPARSE_LEN too).
+    const bool wide_sparse_eff = ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_WIDE_SPARSE") &&
+                                 ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_SPARSE_LEN");
+    GGML_LOG_INFO("ggml_cuda: fast ops for GGML_CUDA_FAST_WIDE_SPARSE: %s (effective, needs SPARSE_LEN)\n",
+                  wide_sparse_eff ? "enabled" : "disabled");
+
     // MoE-MM fast paths have a parent operator switch plus a sub-switch for the current
     // O1/O2 work.  Print the effective state so GGML_CUDA_FAST_MOE_MM=0 is not hidden.
     const bool moe_mm_enabled = ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOE_MM");
@@ -308,6 +350,25 @@ static inline void ggml_cuda_fast_ops_print_startup() {
     const bool o5_enabled = moe_mm_enabled && ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOEMM_O5");
     GGML_LOG_INFO("ggml_cuda: fast ops for GGML_CUDA_FAST_MOEMM_O5: %s (effective)\n",
                   o5_enabled ? "enabled" : "disabled");
+
+    // LID top-k fast path: parent operator switch plus O1 sub-switch.
+    const bool lid_enabled = ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_LID_TOP_K");
+    const bool lid_o1       = lid_enabled && ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_LIDTOP_K_O1");
+    GGML_LOG_INFO("ggml_cuda: fast ops for GGML_CUDA_FAST_LID_TOP_K: %s\n",
+                  lid_enabled ? "enabled" : "disabled");
+    GGML_LOG_INFO("ggml_cuda: fast ops for GGML_CUDA_FAST_LIDTOP_K_O1: %s (effective)\n",
+                  lid_o1 ? "enabled" : "disabled");
+    // O3 fused sparse attention is a sub-switch of GGML_CUDA_FAST_LID_TOP_K and
+    // defaults to on (conventions C3/C4): only GGML_CUDA_FAST_OPS=0 or the
+    // parent operator switch disables it.
+    const bool lid_o3 = lid_enabled && ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_LIDTOP_K_O3");
+    GGML_LOG_INFO("ggml_cuda: fast ops for GGML_CUDA_FAST_LIDTOP_K_O3: %s (effective)\n",
+                  lid_o3 ? "enabled" : "disabled");
+
+    GGML_LOG_INFO("ggml_cuda: moe probe GGML_CUDA_MOE_PROBE=%s (%s%s)\n",
+                  getenv("GGML_CUDA_MOE_PROBE") ? getenv("GGML_CUDA_MOE_PROBE") : "unset",
+                  ggml_cuda_moe_probe_enabled() ? "enabled" : "disabled",
+                  ggml_cuda_moe_probe_verbose() ? ", verbose" : "");
 }
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)

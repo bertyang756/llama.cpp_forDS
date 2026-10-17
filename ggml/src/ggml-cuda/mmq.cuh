@@ -1426,6 +1426,21 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntzw = args.nchannels_y * args.nsamples_y;
     const dim3 block_nums_xy_tiling(nty, ntx, ntzw);
 
+    if (ggml_cuda_moe_probe_type(type)) {
+        const int total_blocks = block_nums_xy_tiling.x * block_nums_xy_tiling.y * block_nums_xy_tiling.z;
+        const int blocks_per_sm = (total_blocks + nsm - 1) / nsm;
+        GGML_LOG_INFO("moe-probe:   kernel: type=%s J=%d fallback=%d prec=%d FAST_Q2=%d\n",
+                      ggml_type_name(type), J, (int) fallback, (int) prec_src1, (int) FAST_Q2);
+        GGML_LOG_INFO("moe-probe:     config: occupancy=%d I=%d K_vram=%d sram_layout=%d stream_k=%d nthreads=%d nwarps=%d\n",
+                      config.occupancy, config.I, config.K_vram, (int) config.sram_layout, (int) config.stream_k,
+                      config.nthreads, nwarps);
+        GGML_LOG_INFO("moe-probe:     smem: nbytes_shared=%zu smpbo=%zu mma_layout=%d\n",
+                      (size_t) nbytes_shared, (size_t) ggml_cuda_info().devices[id].smpbo, (int) config.use_mma_data_layout(cc));
+        GGML_LOG_INFO("moe-probe:     grid: nty=%d ntx=%d ntzw=%d total=%d nsm=%d blocks_per_sm=%d (real occupancy)\n",
+                      block_nums_xy_tiling.x, block_nums_xy_tiling.y, block_nums_xy_tiling.z,
+                      total_blocks, nsm, blocks_per_sm);
+    }
+
     GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
     GGML_ASSERT(args.nsamples_y  % args.nsamples_x  == 0);
     const int channel_ratio = args.nchannels_y / args.nchannels_x;
@@ -1524,6 +1539,14 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         && args.ncols_max >= MMQ_DP4A_MAX_BATCH_SIZE
         && ggml_cuda_mmq_get_config(type, 16, fallback, cc).type != GGML_TYPE_COUNT) {
         J_best = 16;
+    }
+
+    if (ggml_cuda_moe_probe_type(type)) {
+        GGML_LOG_INFO("moe-probe:   switch_J: type=%s J_best=%d ntiles_J_best=%d ncols_opt=%d ncols_max=%d | O1_J16: FAST_MOE_MM=%d O1O2=%d ids_dst=%d expert_ids=%d\n",
+                      ggml_type_name(type), J_best, ntiles_J_best, (int) args.ncols_opt, (int) args.ncols_max,
+                      (int) ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOE_MM"),
+                      (int) ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOEMM_O1O2"),
+                      (int) (args.ids_dst != nullptr), (int) (args.expert_ids != nullptr));
     }
 
     switch (J_best) {

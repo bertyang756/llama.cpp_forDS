@@ -456,6 +456,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
             }
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
+        case GGML_OP_FLASH_ATTN_EXT:
+            // LID (DeepSeek-V4) fused sparse path via src[5]/src[6] is CUDA-only:
+            // reject explicitly (fail-fast) instead of silently ignoring the extra inputs.
+            if (op->src[5] != nullptr || op->src[6] != nullptr) {
+                return false;
+            }
+            return true;
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;

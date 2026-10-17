@@ -1402,7 +1402,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // [D' fix B] decode (small n_tokens) -> prefill (large) transition: force a rebuild so the
+    // previous O3 decode scheduler split state (9269) is not inherited via graph reuse.
+    const bool cur_ubatch_small = ubatch.n_tokens <= 8;
+    const bool phase_changed    = prev_ubatch_small != cur_ubatch_small;
+    const bool reused_ubatch = !graph_reuse_disable && !phase_changed && gf_res_prev_active == res && res->can_reuse(gparams);
+    if (reused_ubatch) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1440,6 +1445,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         gf_res_prev_active = res;
     }
+    prev_ubatch_small = cur_ubatch_small;
 
     // set the input data for the input tensors
     {
@@ -2513,7 +2519,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type), /*is_reserve=*/ true);
 
     res->reset();
 
@@ -2542,7 +2548,8 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                             bool is_reserve) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2560,6 +2567,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.is_reserve  =*/ is_reserve,
     };
 }
 

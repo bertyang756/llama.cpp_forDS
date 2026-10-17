@@ -632,6 +632,11 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    // --cache-file: persist/restore the whole prompt cache to/from a disk file
+    // model_filename: base filename of the model, recorded in the file header
+    bool save_to_file(const std::string & path, const std::string & model_filename);
+    bool load_from_file(const std::string & path, bool has_mtmd, const std::string & model_filename);
 };
 
 // used exclusively by router mode

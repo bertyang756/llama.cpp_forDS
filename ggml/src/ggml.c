@@ -5583,6 +5583,30 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_lid(
+        struct ggml_tensor * a,
+        struct ggml_tensor * lid_csa_mask,
+        struct ggml_tensor * lid_top_k) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL && a->src[6] == NULL);
+
+    GGML_ASSERT(a->src[3] != NULL && a->src[3]->type == GGML_TYPE_F16 && ggml_is_contiguous(a->src[3]));
+    GGML_ASSERT(a->src[3]->ne[1] >= a->src[0]->ne[1]);
+
+    GGML_ASSERT(lid_csa_mask != NULL && lid_csa_mask->type == GGML_TYPE_F16 && ggml_is_contiguous(lid_csa_mask));
+    GGML_ASSERT(lid_csa_mask->ne[2] == 1);
+    GGML_ASSERT(lid_csa_mask->ne[3] == a->src[3]->ne[3]);
+
+    GGML_ASSERT(lid_top_k != NULL && lid_top_k->type == GGML_TYPE_I32 && ggml_is_contiguous(lid_top_k));
+
+    // D' (§7.2a): src[3] is the concat'd real union mask (length == K). The fused index kernel reads
+    // the raw SWA part (first src[3]->ne[0] - lid_csa_mask->ne[0] columns) plus src[5]/src[6].
+    GGML_ASSERT(a->src[3]->ne[0] == a->src[1]->ne[1]);
+
+    a->src[5] = lid_csa_mask;
+    a->src[6] = lid_top_k;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

@@ -2660,6 +2660,11 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // LID (DeepSeek-V4) fused sparse path via src[5]/src[6] is CUDA-only:
+                // reject explicitly (fail-fast) instead of silently ignoring the extra inputs.
+                if (op->src[5] != nullptr || op->src[6] != nullptr) {
+                    return false;
+                }
 #ifdef ASCEND_310P
                 // FA not support on 310p device
                 return false;

@@ -1926,6 +1926,25 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    if (ggml_cuda_moe_probe_type(src0->type)) {
+        GGML_LOG_INFO("moe-probe: MUL_MAT_ID name='%s' type=%s dev=%d cc=%d\n",
+                      dst->name, ggml_type_name(src0->type), ggml_cuda_get_device(), cc);
+        GGML_LOG_INFO("moe-probe:   src0 ne=[%d %d %d %d]  src1 ne=[%d %d %d %d]  ids ne=[%d %d]  dst ne=[%d %d %d %d]\n",
+                      (int) ne00, (int) ne01, (int) ne02, (int) ne03,
+                      (int) ne10, (int) ne11, (int) ne12, (int) ne13,
+                      ids ? (int) ids->ne[0] : -1, ids ? (int) ids->ne[1] : -1,
+                      (int) ne0, (int) ne1, (int) ne2, (int) ne3);
+        GGML_LOG_INFO("moe-probe:   gates: mmvq_max_batch=%d  should_use_mmq(ne12=%d,nExp=%d)=%d  FAST_MOE_MM=%d O1O2=%d  should_use_mmf=%d\n",
+                      get_mmvq_mmid_max_batch(src0->type, cc), (int) ne12, (int) ne02,
+                      (int) ggml_cuda_should_use_mmq(src0->type, cc, ne12, ne02),
+                      (int) ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOE_MM"),
+                      (int) ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOEMM_O1O2"),
+                      (int) ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true));
+        cudaStreamCaptureStatus capture_status;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture_status));
+        GGML_LOG_INFO("moe-probe:   capturing=%d\n", (int) (capture_status != cudaStreamCaptureStatusNone));
+    }
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -1933,6 +1952,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    if (ggml_cuda_moe_probe_type(src0->type)) GGML_LOG_INFO("moe-probe:   -> mmvq decode (ne2=%d <= mmvq_max=%d)\n", (int) ne2, mmvq_mmid_max);
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -1945,6 +1965,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            if (ggml_cuda_moe_probe_type(src0->type)) GGML_LOG_INFO("moe-probe:   -> mmq (should_use_mmq)\n");
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
@@ -1958,17 +1979,20 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             && ggml_is_quantized(src0->type)
             && ne12 >= MMQ_DP4A_MAX_BATCH_SIZE
             && ggml_cuda_should_use_mmq(src0->type, cc, /*ne11=*/0, /*n_experts=*/ne02)) {
+            if (ggml_cuda_moe_probe_type(src0->type)) GGML_LOG_INFO("moe-probe:   -> mmq (O1O2 fast path)\n");
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            if (ggml_cuda_moe_probe_type(src0->type)) GGML_LOG_INFO("moe-probe:   -> mmf\n");
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
     }
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
+    if (ggml_cuda_moe_probe_type(src0->type)) GGML_LOG_INFO("moe-probe:   -> sync-fallback (needs_sync)\n");
     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
     cudaStream_t stream = ctx.stream();
 

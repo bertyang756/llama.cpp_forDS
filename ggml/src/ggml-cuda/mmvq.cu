@@ -1429,6 +1429,16 @@ void ggml_cuda_mul_mat_vec_q(
 
     cudaStream_t stream = ctx.stream();
 
+    if (ggml_cuda_moe_probe_type(src0->type) && ids) {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        GGML_LOG_INFO("moe-probe:   -> mmvq decode (dp4a): type=%s cc=%d ne2=%d n_expert_used=%d\n",
+                      ggml_type_name(src0->type), cc, (int) ne2, (int) ids->ne[0]);
+        GGML_LOG_INFO("moe-probe:     src0 ne=[%d %d %d %d] src1 ne=[%d %d %d %d] ids ne=[%d %d] dst ne=[%d %d %d %d]\n",
+                      (int) ne00, (int) ne01, (int) ne02, (int) ne03,
+                      (int) ne10, (int) ne11, (int) ne12, (int) ne13,
+                      (int) ids->ne[0], (int) ids->ne[1], (int) ne0, (int) ne1, (int) ne2, (int) ne3);
+    }
+
     const size_t ts_src0 = ggml_type_size(src0->type);
     const size_t ts_src1 = ggml_type_size(src1->type);
     const size_t ts_dst  = ggml_type_size(dst->type);

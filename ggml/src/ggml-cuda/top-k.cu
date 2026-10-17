@@ -1,5 +1,6 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
+#include "lid-topk-fast.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
@@ -225,7 +226,21 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+
 #ifdef CUB_TOP_K_AVAILABLE
+    // ---- LID top-k fast path (O1): parallel 2-digit radix-select top-k ----
+    // 开关: GGML_CUDA_FAST_OPS(总) -> GGML_CUDA_FAST_LID_TOP_K(算子) -> GGML_CUDA_FAST_LIDTOP_K_O1(子项)。
+    // 正确性: 2-digit 高16位阈值 -> gathered ⊇ top-k; overflow(超大 tie, gathered>CAPF) 由 kernel 内 device 兜底。
+    // 性能: 三组 nrows 数据(bench_v6_nrows_*.txt): nrows=1(decode) D6 输 cub 2.6~4.3x -> 走 cub;
+    //   nrows>1(prefill/长 batch) D6 大赢 cub 0.01~0.56x -> 走 fast。CAPF=2048, P=16384(超长 ctx 最优)。
+    // 图安全: 无 host 读回/同步, 可在 CUDA Graph capture 区内发射(llama.cpp 默认开启 CUDA Graph)。
+    if (ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_LID_TOP_K") &&
+        ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_LIDTOP_K_O1") &&
+        ncols > 0 && nrows > 1 && k > 0 && k <= (int64_t) ggml_lid_topk_fast::CAPF && k <= ncols) {
+        ggml_lid_topk_fast::tkr_launch(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
+        return;
+    }
+
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
     // TODO: investigate if there exists a point where parallelized argsort is faster than sequential top-k

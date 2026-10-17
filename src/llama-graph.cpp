@@ -2618,7 +2618,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * lid_csa_mask,
+         ggml_tensor * lid_top_k) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2651,6 +2653,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        if (lid_csa_mask) {
+            // D' (§7.2a): hand the CSA causal mask and top-k indices to the CUDA backend via the spare
+            // src[5]/src[6] slots (declarative setter with shape asserts; other backends reject
+            // the op in supports_op). src[3] stays the concat'd real union mask; the fused index
+            // kernel reads the raw SWA part (first src[3]->ne[0] - lid->ne[0] columns) + src[5]/src[6].
+            ggml_flash_attn_ext_set_lid(cur, lid_csa_mask, lid_top_k);
+        }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);

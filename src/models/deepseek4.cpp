@@ -5,8 +5,53 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+
+// O3 (LID) fused sparse attention path: replaces the top-k union mask chain
+// (fill/set_rows/add + concat) with a fused index kernel on the CUDA backend.
+// Switch follows the conventions (README §4 C3/C4): O3 is a sub-switch of
+// GGML_CUDA_FAST_LID_TOP_K and defaults to on; GGML_CUDA_FAST_OPS=0 is a hard
+// master switch that disables everything regardless of the sub-switches.
+static bool dsv4_lid_o3_enabled() {
+    const char * master = getenv("GGML_CUDA_FAST_OPS");
+    if (master && atoi(master) == 0) {
+        return false;
+    }
+    const char * lid = getenv("GGML_CUDA_FAST_LID_TOP_K");
+    if (lid && atoi(lid) == 0) {
+        return false;
+    }
+    const char * o3 = getenv("GGML_CUDA_FAST_LIDTOP_K_O3");
+    return o3 == nullptr || atoi(o3) != 0;   // default on, follows parent switch
+}
+
+// 镜像 ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_SPARSE_LEN")（含 GGML_CUDA_FAST_OPS 总开关）。
+// 图侧 attach_lid 门控用它决定镜像哪一版稀疏阈值: 新启发式(GGML_CUDA_FAST_SPARSE_LEN)或旧式
+// max(4096, 2*n_gather)。必须与 CUDA 侧 shall_use_sparse() 完全一致, 否则挂上 src[5]/src[6]
+// 但 CUDA 判稠密时, 会在运行期被 abort 守卫复核 shall_use_sparse(1,8) 时 GGML_ABORT。
+static bool dsv4_lid_sparse_len_fast() {
+    const char * master = getenv("GGML_CUDA_FAST_OPS");
+    if (master && atoi(master) == 0) {
+        return false;
+    }
+    const char * s = getenv("GGML_CUDA_FAST_SPARSE_LEN");
+    return s == nullptr || atoi(s) != 0;
+}
+
+// 镜像 ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_WIDE_SPARSE")（含总开关）。
+// GGML_CUDA_FAST_WIDE_SPARSE 是 GGML_CUDA_FAST_LIDTOP_K_O3 的同级开关(合并 UNION_LID_PREFILL 后)。
+// prefill union(融合索引)需要宽 sparse 路径被选中(switch_ncols1 has_wide_sparse), 否则挂 src[5]/src[6 会走稠密 → abort。
+// O3 开 + WIDE_SPARSE 开 → prefill ncols1=8 union 融合索引; O3 开 + WIDE_SPARSE 关 → 回落到 stock prefill(不挂 src)。
+static bool dsv4_wide_sparse() {
+    const char * master = getenv("GGML_CUDA_FAST_OPS");
+    if (master && atoi(master) == 0) {
+        return false;
+    }
+    const char * s = getenv("GGML_CUDA_FAST_WIDE_SPARSE");
+    return s == nullptr || atoi(s) != 0;
+}
 
 static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     if (ext_factor == 0.0f) {
@@ -752,13 +797,77 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(k_all, "csa_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
-    ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
-
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
-    cb(kq_mask, "csa_lid_kq_mask", il);
 
     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
+
+    // D' (方案 D', §7.2a): 图恒 stock —— 掩码链恒构建、src[3]=concat 并集真掩码(稠密 fallback 语义正确)。
+    // src[5]/src[6] 只在 decode(小批量)+阈值以上挂载, prefill 恒不挂 → 融合 v3 只在 decode 生效。
+    // 四种图(prefill/decode × 稠密/稀疏)的 n_nodes/n_leafs 相同 → 与 reserve(stock) 一致 → 0 realloc。
+    // 真实稀疏集 = raw SWA 窗 ∪ (top_k ∩ CSA 因果) (build_top_k_mask 是 add 不是 OR, -inf 支配)。
+    ggml_tensor * kq_mask       = nullptr;
+    ggml_tensor * lid_csa_mask  = nullptr;
+    ggml_tensor * lid_top_k     = nullptr;
+    {
+        const int64_t n_stream     = k_all->ne[3];
+        const int64_t n_queries    = q->ne[2] / n_stream;                              // == op Q->ne[1]
+        const int64_t n_kv_concat  = raw_mask->ne[0] + inp_csa.kq_mask->ne[0];          // == op K->ne[1]
+        const int64_t n_gather     = std::min<int64_t>(n_queries, 64/8) * n_kv_max;
+        const int64_t gqa_ratio    = n_head / n_head_kv;
+        // A 方案 (O3_slot_realloc_handoff §4.A): reserve 的 decode 档也 attach src[5]/src[6,
+        // → reserve 的 scheduler 图 = 9269, 覆盖 O3 decode 与复用它的第二 prefill → 0 realloc。
+        // reserve 的 prefill 档 (n_queries>8) 保持 stock(attach_lid=0)。
+        // 镜像 CUDA shall_use_sparse(1,8), 沿用 §6.1 同步, 避免"挂 src[5] 但 CUDA 判稠密"→ abort 守卫误触发。
+        // decode O3 (n_queries<=8): 只挂 src[5]/src[6 于 per-query 阈值以上。
+        const bool decode_attach = dsv4_lid_o3_enabled() && cparams.flash_attn &&
+            hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+            // Option A (C15): MMA_F16 分发保证选 ncols2=8 且 may_use_sparse(...,1,8) 成立,
+            // abort 检查不会误判: head dim 必须 256/512 且 gqa_ratio > 4。
+            (q->ne[0] == 256 || q->ne[0] == 512) && gqa_ratio > 4 &&
+            raw_mask->ne[2] == 1 && raw_mask->ne[1] >= n_queries &&
+            n_queries <= 8 &&
+            // 镜像 shall_use_sparse(1,8): 开关开 → 新启发式 max(512, C*n_kv_max), 开关关 → 旧式。
+            // O3 路径 ncols1 恒为 1, 系数按每 tile query 数 n_queries 取 2/3/4。
+            n_kv_concat % 256 == 0 && n_kv_concat >= (dsv4_lid_sparse_len_fast()
+                ? std::max<int64_t>(512, (n_queries <= 2 ? 2 : n_queries <= 8 ? 3 : 4) * n_kv_max)
+                : std::max<int64_t>(4096, 2*n_gather));
+        // prefill union (n_queries>8, §9.2a C): 挂 src[5]/src[6 于**宽阈值**以上。
+        // 合并后由 O3(父门) + WIDE_SPARSE(同级开关)共同控制: O3 开且 WIDE_SPARSE 开 → union 融合索引;
+        // O3 开但 WIDE_SPARSE 关 → 回落到 stock prefill(不挂 src, CUDA 走 per-query stock sparse)。
+        // 镜像 CUDA shall_use_sparse(8,8) + switch_ncols1 的 union_lid 判据(has_lid && n_queries>8) +
+        // has_wide_sparse(需 GGML_CUDA_FAST_WIDE_SPARSE), 避免"挂 src 但 CUDA 判稠密"
+        // → abort 守卫误触发。宽阈值: sparse_len_fast && wide_sparse → max(512, 4*n_kv_max); 否则旧式
+        // max(4096, 2*(8*n_kv_max)) = max(4096, 16*n_kv_max)。
+        const bool union_attach = dsv4_lid_o3_enabled() && cparams.flash_attn &&
+            hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+            (q->ne[0] == 256 || q->ne[0] == 512) && gqa_ratio > 4 &&
+            raw_mask->ne[2] == 1 && raw_mask->ne[1] >= n_queries &&
+            n_queries > 8 &&
+            dsv4_wide_sparse() &&
+            n_kv_concat % 256 == 0 && n_kv_concat >= (dsv4_lid_sparse_len_fast()
+                ? std::max<int64_t>(512, 4 * n_kv_max)
+                : std::max<int64_t>(4096, 16 * n_kv_max));
+        const bool attach_lid = decode_attach || union_attach;
+        // [方案A 阶段1] reserve(仅尺寸, is_reserve=true)恒挂 src[5]/src[6 →
+        // reserve 图 node_allocs[i].src[5]/[6] 恒覆盖 O3 decode 的叶子(lid_csa_mask/top_k, 容量)
+        // → decode 的 alloc_graph 不再因 src 未覆盖而 realloc → node_allocs 留容量 → prefill 增长被吸收 → 0 昂贵 realloc。
+        // 运行时(is_reserve=false)仍只在 attach_lid(decode O3, n_queries<=8+阈值; 或 prefill union,
+        // O3+WIDE_SPARSE 开 + 宽阈值)时挂。合并后 prefill 在 union 开启时也挂 src[5]/src[6。
+        // 内核仍按 src[5] 存在判 O3 路径: 运行时 prefill 若 O3 开但 WIDE_SPARSE 关则不挂 src → 走 stock 稀疏/稠密。
+        if (attach_lid || res->get_params().is_reserve) {
+            lid_csa_mask = inp_csa.kq_mask;
+            lid_top_k    = top_k;
+        }
+    }
+
+    // D': 恒构建 stock 掩码链, src[3] = concat 并集真掩码。
+    {
+        ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+        kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+        cb(kq_mask, "csa_lid_kq_mask", il);
+    }
+
+    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il,
+                                       lid_csa_mask, lid_top_k);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }

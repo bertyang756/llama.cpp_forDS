@@ -265,7 +265,8 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                             bool is_reserve = false) const;
 
     llm_graph_cb graph_get_cb() const;
 
@@ -377,6 +378,11 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // [D' fix B] phase flag to force a graph rebuild at decode<->prefill transitions,
+    // so the O3 decode's scheduler split state (9269 + 305 copy nodes) is not inherited
+    // by the next prefill via graph reuse, avoiding expensive size-growth reallocs.
+    bool prev_ubatch_small = true;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

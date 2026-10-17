@@ -267,6 +267,13 @@ void ggml_cuda_mul_mat_q(
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
 
+    if (ggml_cuda_moe_probe_type(src0->type)) {
+        const int n_kblocks = (int) (ne10_padded / QK8_1_MMQ);
+        GGML_LOG_INFO("moe-probe:   mmq: K=%d expert_rows=%d n_experts=%d ne10=%d ne11=%d T=%d n_expert_used=%d ne_get_rows=%d dedup_bcast=%d fallback=%d n_kblocks=%d\n",
+                      (int) ne00, (int) ne01, (int) ne02, (int) ne10, (int) ne11, (int) ne12,
+                      (int) n_expert_used, (int) ne_get_rows, (int) dedup_bcast, (int) fallback, n_kblocks);
+    }
+
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
@@ -340,6 +347,14 @@ void ggml_cuda_mul_mat_q(
         && ne12 >= MMQ_DP4A_MAX_BATCH_SIZE
         && !use_native_fp4
         && !is_capturing;
+
+    if (ggml_cuda_moe_probe_type(src0->type)) {
+        GGML_LOG_INFO("moe-probe:   fast_bucket=%d (FAST_MOE_MM=%d O1O2=%d ne12=%d>=%d ids=%d native_fp4=%d capturing=%d)\n",
+                      (int) fast_bucket,
+                      (int) ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOE_MM"),
+                      (int) ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOEMM_O1O2"),
+                      (int) ne12, MMQ_DP4A_MAX_BATCH_SIZE, (int) (ids != nullptr), (int) use_native_fp4, (int) is_capturing);
+    }
 
     if (fast_bucket) {
         const int n_experts     = (int) ne02;
@@ -429,6 +444,14 @@ void ggml_cuda_mul_mat_q(
 
         // Padding rows per k-block so the mmq kernel can read J columns past the last row.
         const int pad = 128; // >= max J
+        if (ggml_cuda_moe_probe_verbose() && ggml_cuda_moe_probe_type(src0->type)) {
+            GGML_LOG_INFO("moe-probe:     buckets: thresholds={16,32,48,64} nbuckets=%d pad=%d\n", nbuckets, pad);
+            for (int b = 0; b < nbuckets; ++b) {
+                if (bucket_exp[b].empty()) continue;
+                GGML_LOG_INFO("moe-probe:       bucket %d: nE=%d nrows=%d J=%d stride_rows=%d\n",
+                              b, nE[b], nrows[b], bucket_max[b], nrows[b] + pad);
+            }
+        }
         for (int b = 0; b < nbuckets; ++b) {
             if (nE[b] == 0) {
                 continue;

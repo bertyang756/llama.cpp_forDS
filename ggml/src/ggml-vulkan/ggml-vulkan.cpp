@@ -15379,6 +15379,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // LID (DeepSeek-V4) fused sparse path via src[5]/src[6] is CUDA-only:
+                // reject explicitly (fail-fast) instead of silently ignoring the extra inputs.
+                if (op->src[5] != nullptr || op->src[6] != nullptr) {
+                    return false;
+                }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];

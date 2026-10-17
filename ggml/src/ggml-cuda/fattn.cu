@@ -122,6 +122,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     ggml_cuda_kernel_launch(kernel, launch_params,
         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
+
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
@@ -133,6 +134,9 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * mask = dst->src[3];
+    // D' (LID) fused sparse path: src[5] is the CSA causal mask, src[3] the concat'd real union mask;
+    // the raw SWA part is the first src[3]->ne[0] - lid->ne[0] columns.
+    const ggml_tensor * lid  = dst->src[5];
 
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
@@ -144,10 +148,49 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
-        mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
-        mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
+    bool mask_ok = mask != nullptr && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1;
+    if (mask_ok && lid != nullptr) {
+        // D': src[3] is the concat'd real union mask (length == K); the fused index kernel reads the
+        // raw SWA part (first src[3]->ne[0] - lid->ne[0] columns) + src[5]/src[6]. ncols1==1 → decode
+        // O3 per-query; ncols1==8 → prefill union(§9.2a A/B)。
+        mask_ok = (ncols1 == 1 || ncols1 == 8) && lid->ne[2] == 1 && lid->ne[3] == mask->ne[3] && mask->ne[0] == K->ne[1];
+    } else if (mask_ok) {
+        mask_ok = mask->ne[0] == K->ne[1];
+    }
+
+    const bool ok = GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+        mask_ok && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f;
+    if (!ok) {
+        return false;
+    }
+    // [WIDE-SPARSE CALIBRATION, temp] force hook: dense|perq|wide.
+    const char * force = getenv("GGML_CUDA_FAST_SPARSE_FORCE");
+    if (force && strcmp(force, "dense") == 0) {
+        return false;
+    }
+    if (force && (strcmp(force, "perq") == 0 || strcmp(force, "wide") == 0)) {
+        // force sparse regardless of the length threshold; perq only for ncols1==1, wide only for ncols1==8
+        if (strcmp(force, "perq") == 0 && ncols1 != 1) return false;
+        if (strcmp(force, "wide")  == 0 && ncols1 != 8) return false;
+        return true;
+    }
+    // Sparse gather vs dense pass crossover.
+    //
+    // The gather reads n_kv_max rows per query, the dense pass reads K rows (shared by up to
+    // 64/ncols2 queries), but the dense kernel is compute-bound, so the relevant quantity is the
+    // gather's work per row. Measured crossover (test-backend-ops perf, hsk=hsv=512, gqa_ratio=64,
+    // CMP 170HX / RTX 3080 / RTX A4000): K/n_kv_max ~= 1.4-1.7 for nb=1 and ~3.2-3.8 for nb=512,
+    // i.e. the gather costs ~C x more per KV row than the dense pass. Use a conservative C per
+    // query batch (the dense kernel's batch advantage saturates at min(nQ, 64/ncols2)).
+    // The previous form (2 * min(nQ, 8) * n_kv_max) assumed an 8x row reuse that does not show up
+    // in practice and kept the dense path up to ~4-5x too long.
+    static const bool sparse_len_fast = ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_SPARSE_LEN");
+    static const bool wide_sparse     = ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_WIDE_SPARSE");
+    const int64_t n_kv_min = (sparse_len_fast && (ncols1 == 1 || (ncols1 == 8 && wide_sparse)))
+        ? std::max<int64_t>(512, (ncols1 == 8 ? 4 : (Q->ne[1] <= 2 ? 2 : Q->ne[1] <= 8 ? 3 : 4)) * n_kv_max)
+        : std::max<int64_t>(4096, 2*n_gather);
+
+    return K->ne[1] >= n_kv_min;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
@@ -159,8 +202,29 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
         // a sparse variant at the full tile width gathers the union of its queries once, prefer it for large batches
-        constexpr bool has_wide_sparse = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 64/ncols2, ncols2);
-        if (!(has_wide_sparse && Q->ne[1] > 32/ncols2) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, ncols2)) {
+        constexpr bool has_wide_sparse_cfg = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 64/ncols2, ncols2);
+        // wide sparse is a kernel-selection sub-switch: with it off, prefill falls back to
+        // per-query sparse (the pre-wide behavior), enabling A/B on the stock graph.
+        const bool has_wide_sparse = has_wide_sparse_cfg && ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_WIDE_SPARSE");
+        // O3 (LID) fused path is per-query only (decode): src[5] carries the CSA causal mask and the
+        // fused v3 index kernel requires ncols1==1. The wide (ncols1==8) union path (§9.2a D) is for
+        // prefill only: src[5] attached for n_queries>8 → union 融合索引 + mask gather. Detect via
+        // dst->src[5] + batch size: union_lid = has_lid && n_queries>8. src[5] 挂载已由图侧合并为
+        // O3(父门) + WIDE_SPARSE 控制; decode(n_queries<=8) stays per-query to keep the wide kernel
+        // from picking src[3]=raw mask wrongly.
+        const bool has_lid = dst->src[5] != nullptr;
+        const bool union_lid = has_lid && Q->ne[1] > 8;
+        // [WIDE-SPARSE CALIBRATION, temp] force hook: dense|perq|wide.
+        const char * force = getenv("GGML_CUDA_FAST_SPARSE_FORCE");
+        const bool force_wide = force && strcmp(force, "wide") == 0;
+        const bool force_perq = force && strcmp(force, "perq") == 0;
+        // wide sparse: one union index list per group of ncols1=64/ncols2 queries; prefer it for large
+        // batches. Prefill union (union_lid) may go wide despite has_lid; decode O3 never does.
+        if (!force_perq && (force_wide || Q->ne[1] > 32/ncols2) && (union_lid || !has_lid) && has_wide_sparse && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 64/ncols2, ncols2)) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+            return;
+        }
+        if (!union_lid && (force_perq || has_lid || !(has_wide_sparse && Q->ne[1] > 32/ncols2)) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, ncols2)) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
             return;
         }
@@ -757,6 +821,26 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    if (dst->src[5] != nullptr) {
+        // D' (LID) fused sparse path: src[5] carries the CSA causal mask and src[3] the concat'd real
+        // union mask. The fused index path must be the MMA_F16 sparse gather. decode O3 (ncols1==1) →
+        // per-query; prefill union (§9.2a D, ncols1==8) → wide sparse gather + mask. src[5]/src[6]
+        // are only attached when a sparse path is selected, so enforce the sparse gather here to keep
+        // the fused src[5]/src[6] wiring from running a non-fused kernel.
+        const ggml_tensor * Q  = dst->src[0];
+        const ggml_tensor * V  = dst->src[2];
+        const int id = ggml_cuda_get_device();
+        const int cc = ggml_cuda_info().devices[id].cc;
+        const bool sparse_ok = ggml_cuda_get_best_fattn_kernel(id, dst) == BEST_FATTN_KERNEL_MMA_F16 &&
+            ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(Q->ne[0], V->ne[0], 1, 8) &&
+            (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 8) ||
+             ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 8, 8));
+        if (!sparse_ok) {
+            GGML_ABORT("fatal error: O3 (LID) fused sparse path requires the MMA_F16 sparse gather");
+        }
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "fattn-lid-sparse.cuh"
 
 #include <cstdint>
 
@@ -989,6 +990,17 @@ void launch_fattn(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
+    // O3 (LID) fused sparse path: src[5] carries the CSA causal mask and src[6] the CSA-space top-k
+    // indices, while src[3] only holds the raw SWA mask. The fused kernel rebuilds the exact sparse
+    // attendance set (raw SWA window ∪ (top_k ∩ CSA causal)) without materializing the union mask;
+    // every attended position has mask bias 0, so the gather itself needs no mask values.
+    const ggml_tensor * lid_csa_mask = dst->src[5];
+    const ggml_tensor * lid_top_k    = dst->src[6];
+    const bool use_lid = use_sparse && lid_csa_mask != nullptr;
+    // ncols1==1 → decode O3 per-query 融合索引; ncols1==8 → prefill union 融合索引(§9.2a A/B)。
+    GGML_ASSERT(!lid_csa_mask || (use_sparse && (ncols1 == 1 || ncols1 == 8) && lid_top_k != nullptr));
+
+
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
@@ -1103,7 +1115,35 @@ void launch_fattn(
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 
         KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        if (use_lid) {
+            // D' (§7.2a): fused index producer = raw SWA part of src[3] ∪ (top_k ∩ CSA causal), no
+            // intermediate union mask. src[3] is the concat'd mask, so n_kv_raw = src[3]->ne[0] - lid->ne[0].
+            // §9.2a A/B: ncols1==8 (prefill union) → union 融合索引(免扫全 n_csa); ncols1==1 (decode O3) → v3 per-query。
+            if (ncols1 == 8) {
+                fattn_lid_sparse::union_lid_sparse_index_launch(
+                    lid_top_k->data, mask->data, lid_csa_mask->data,
+                    KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists,
+                    ntiles_x, (int) mask->ne[3], (int) lid_top_k->ne[0],
+                    (int)(mask->ne[0] - lid_csa_mask->ne[0]), (int) lid_csa_mask->ne[0], (int) n_kv_max,
+                    lid_top_k->nb[1] / sizeof(int32_t), lid_top_k->nb[3] / sizeof(int32_t),
+                    mask->nb[1] / sizeof(half), mask->nb[3] / sizeof(half),
+                    lid_csa_mask->nb[1] / sizeof(half), lid_csa_mask->nb[3] / sizeof(half),
+                    main_stream);
+            } else {
+                fattn_lid_sparse::lid_sparse_index_launch(
+                    lid_top_k->data, mask->data, lid_csa_mask->data,
+                    KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists,
+                    ntiles_x, (int) mask->ne[3], (int) lid_top_k->ne[0],
+                    (int)(mask->ne[0] - lid_csa_mask->ne[0]), (int) lid_csa_mask->ne[0], (int) n_kv_max,
+                    lid_top_k->nb[1] / sizeof(int32_t), lid_top_k->nb[3] / sizeof(int32_t),
+                    mask->nb[1] / sizeof(half), mask->nb[3] / sizeof(half),
+                    lid_csa_mask->nb[1] / sizeof(half), lid_csa_mask->nb[3] / sizeof(half),
+                    main_stream);
+            }
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1134,6 +1174,12 @@ void launch_fattn(
 
     const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+
+    // O3 decode (ncols1==1): the gather reads no mask values (all gathered slots are causal-visible
+    // with bias 0), the fused index kernel has already produced the concat-space indices.
+    // Prefill union (ncols1==8, §9.2a B): union 索引只含"至少一列可见"的位置, 对列 j 非可见者需 -inf
+    // → **必须保留掩码 gather**(读 src[3] concat 并集掩码), 不能像 decode 设 nullptr(漏 -inf = 错)。
+    const ggml_tensor * mask_kernel = (use_lid && ncols1 == 1) ? nullptr : mask;
 
     dim3 blocks_num;
     if (stream_k) {
@@ -1240,7 +1286,7 @@ void launch_fattn(
         (const char *) Q->data,
         K_data,
         V_data,
-        mask ? ((const char *) mask->data) : nullptr,
+        mask_kernel ? ((const char *) mask_kernel->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
@@ -1248,8 +1294,10 @@ void launch_fattn(
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
+        // ne31/ne32/ne33 come from the raw mask even in O3 mode: ne33 is the sequence count used to
+        // index the sparse lists, only the mask data pointer (and hence stride_mask) is dropped.
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask_kernel ? mask_kernel->nb[1] : 0, mask_kernel ? mask_kernel->nb[2] : 0, mask_kernel ? mask_kernel->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
 
@@ -1299,4 +1347,5 @@ void launch_fattn(
             dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }
     CUDA_CHECK(cudaGetLastError());
+
 }

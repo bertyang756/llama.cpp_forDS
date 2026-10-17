@@ -248,6 +248,9 @@ public:
     bool next();
 
     uint32_t get_n_kv() const;
+    // 底层 cache 的分配 cell 数（== 图能用的上限）。O3 用它在图侧识别"sched_reserve 的最大
+    // 上下文图"：满分配那一档强制走 stock 掩码链，使 reserve 图成为所有运行图的内存超集。
+    uint32_t get_n_kv_max() const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;

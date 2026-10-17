@@ -861,6 +861,17 @@ public:
     }
 
     ~server_context_impl() {
+        // --cache-file: persist the CPU-RAM prompt cache to a disk file at exit
+        // prompt_cache is a member and still alive here; destroy() does not clear it
+        if (prompt_cache && !params_base.cache_file.empty()) {
+            // record the model base filename (no path) in the file header
+            std::string model_fname;
+            if (!params_base.model.path.empty()) {
+                model_fname = std::filesystem::path(params_base.model.path).filename().string();
+            }
+            prompt_cache->save_to_file(params_base.cache_file, model_fname);
+        }
+
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -1515,6 +1526,23 @@ private:
                 if (!supported && specified && enabled) {
                     SRV_WRN("%s", "chat template does NOT support preserving reasoning, --reasoning-preserve has no effect\n");
                 }
+            }
+        }
+
+        // --cache-file: load the CPU-RAM prompt cache from a disk file if it exists
+        // (model, slots, and cache-ram are all initialized by this point)
+        if (prompt_cache && !params_base.cache_file.empty()) {
+            const std::string & f = params_base.cache_file;
+            if (std::filesystem::exists(f)) {
+                // pass the current model base filename for header comparison
+                std::string model_fname;
+                if (!params_base.model.path.empty()) {
+                    model_fname = std::filesystem::path(params_base.model.path).filename().string();
+                }
+                SRV_INF("--cache-file %s: loading prompt cache\n", f.c_str());
+                prompt_cache->load_from_file(f, mctx != nullptr, model_fname);
+            } else {
+                SRV_INF("--cache-file %s: not found, skipping load\n", f.c_str());
             }
         }
 
